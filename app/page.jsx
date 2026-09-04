@@ -10,6 +10,9 @@ export default function Home() {
 
   const [ean, setEan] = useState(null);
   const [manualQuery, setManualQuery] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+
   const [product, setProduct] = useState(null);
   const [customName, setCustomName] = useState("");
   const [rating, setRating] = useState(5);
@@ -21,11 +24,13 @@ export default function Home() {
   const [sortOrder, setSortOrder] = useState("newest");
   const [recentScans, setRecentScans] = useState([]);
   const [shoppingList, setShoppingList] = useState([]);
+
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [uploadingImage, setUploadingImage] = useState(false);
   const [loadingReviews, setLoadingReviews] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
 
-  // Zakładki: 'scan', 'profile', 'list'
+  // Zakładki menu: 'scan', 'profile', 'list'
   const [activeTab, setActiveTab] = useState("scan");
   const [userReviews, setUserReviews] = useState([]);
 
@@ -44,7 +49,7 @@ export default function Home() {
     return () => subscription.unsubscribe();
   }, []);
 
-  // Obsługa latarki
+  // Włącznik latarki / flesza
   const toggleTorch = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
@@ -54,13 +59,14 @@ export default function Home() {
         await track.applyConstraints({ advanced: [{ torch: !torchOn }] });
         setTorchOn(!torchOn);
       } else {
-        alert("Twoje urządzenie nie pozwala na włączenie latarki z przeglądarki.");
+        alert("Twoje urządzenie nie pozwala na włączenie latarki w przeglądarce.");
       }
     } catch {
-      alert("Błąd dostępu do flesza.");
+      alert("Brak dostępu do modułu flesza.");
     }
   };
 
+  // Logowanie linkiem Magic Link
   const handleAuth = async (e) => {
     e.preventDefault();
     if (!authEmail) return;
@@ -70,7 +76,7 @@ export default function Home() {
       options: { emailRedirectTo: window.location.origin }
     });
     if (error) setAuthMessage("Błąd: " + error.message);
-    else setAuthMessage("Link wysłany! Sprawdź pocztę i kliknij potwierdzenie.");
+    else setAuthMessage("Link wysłany! Otwórz pocztę i kliknij potwierdzenie.");
   };
 
   const handleLogout = async () => {
@@ -78,6 +84,7 @@ export default function Home() {
     setUser(null);
   };
 
+  // Lista zakupowa
   const loadShoppingList = async () => {
     if (!user) return;
     const { data } = await supabase.from("shopping_list").select("*").eq("user_id", user.id);
@@ -85,7 +92,7 @@ export default function Home() {
   };
 
   const toggleShoppingList = async (targetEan, targetName) => {
-    if (!user) return alert("Zaloguj się, aby zapisywać listę zakupów!");
+    if (!user) return alert("Zaloguj się, aby tworzyć własną listę zakupów!");
     const exists = shoppingList.find((i) => i.ean === targetEan);
     if (exists) {
       await supabase.from("shopping_list").delete().eq("id", exists.id);
@@ -134,19 +141,70 @@ export default function Home() {
     setLoadingReviews(false);
   };
 
+  // Wyszukiwarka tekstowa produktów
+  const handleTextSearch = async () => {
+    if (!manualQuery.trim()) return;
+    // Sprawdź, czy wpisano sam kod EAN (same cyfry)
+    if (/^\d+$/.test(manualQuery.trim())) {
+      loadProductData(manualQuery.trim());
+      return;
+    }
+
+    setSearching(true);
+    try {
+      const res = await fetch(`https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(manualQuery)}&search_simple=1&action=process&json=1&page_size=5`);
+      const data = await res.json();
+      setSearchResults(data.products || []);
+    } catch {
+      alert("Błąd podczas wyszukiwania produktów.");
+    }
+    setSearching(false);
+  };
+
+  // Wgrywanie własnego zdjęcia do Supabase Storage
+  const handleImageUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file || !ean) return;
+
+    setUploadingImage(true);
+    const fileExt = file.name.split(".").pop();
+    const filePath = `${ean}-${Date.now()}.${fileExt}`;
+
+    const { error: uploadError } = await supabase.storage.from("product-images").upload(filePath, file);
+
+    if (uploadError) {
+      alert("Błąd wgrywania zdjęcia: " + uploadError.message);
+      setUploadingImage(false);
+      return;
+    }
+
+    const { data: { publicUrl } } = supabase.storage.from("product-images").getPublicUrl(filePath);
+
+    await supabase.from("product_names").upsert(
+      { ean, custom_name: customName || product.product_name, custom_image: publicUrl },
+      { onConflict: "ean" }
+    );
+
+    setProduct((prev) => ({ ...prev, image_url: publicUrl }));
+    setUploadingImage(false);
+    alert("Zdjęcie zostało dodane!");
+  };
+
   const loadProductData = async (targetEan) => {
     if (navigator.vibrate) navigator.vibrate(100);
     setEan(targetEan);
+    setSearchResults([]);
 
     const { data: nameData } = await supabase
       .from("product_names")
-      .select("custom_name")
+      .select("custom_name, custom_image")
       .eq("ean", targetEan)
       .single();
 
     let fetchedName = nameData?.custom_name || null;
-    let imgUrl = "";
+    let imgUrl = nameData?.custom_image || "";
     let nutriScore = null;
+    let ecoScore = null;
     let isVegan = null;
     let allergens = "";
 
@@ -155,8 +213,9 @@ export default function Home() {
       const data = await res.json();
       if (data.status === 1) {
         if (!fetchedName) fetchedName = data.product.product_name;
-        imgUrl = data.product.image_url || "";
+        if (!imgUrl) imgUrl = data.product.image_url || "";
         nutriScore = data.product.nutriscore_grade?.toUpperCase() || null;
+        ecoScore = data.product.ecoscore_grade?.toUpperCase() || null;
         allergens = data.product.allergens_tags?.map((a) => a.replace("en:", "")).join(", ") || "";
         if (data.product.ingredients_analysis_tags) {
           isVegan = data.product.ingredients_analysis_tags.includes("en:vegan");
@@ -169,6 +228,7 @@ export default function Home() {
       product_name: finalName,
       image_url: imgUrl,
       nutriScore,
+      ecoScore,
       allergens,
       isVegan,
     });
@@ -186,7 +246,10 @@ export default function Home() {
     const trimmedCustom = customName.trim();
 
     if (trimmedCustom) {
-      await supabase.from("product_names").upsert({ ean, custom_name: trimmedCustom }, { onConflict: "ean" });
+      await supabase.from("product_names").upsert(
+        { ean, custom_name: trimmedCustom },
+        { onConflict: "ean" }
+      );
       setProduct((prev) => ({ ...prev, product_name: trimmedCustom }));
     }
 
@@ -211,21 +274,22 @@ export default function Home() {
     if (error) {
       alert("Błąd zapisu!");
     } else {
-      alert("Zapisano pomyślnie!");
+      alert("Zapisano!");
       await fetchReviews(ean);
     }
   };
 
+  // Eksport bazy do CSV
   const exportCSV = () => {
     if (!userReviews.length) return alert("Brak danych do pobrania.");
-    let csv = "EAN,Nazwa,Ocena,Cena,Data\n";
+    let csv = "EAN,Nazwa,Ocena,Cena,Sklep,Data\n";
     userReviews.forEach((r) => {
-      csv += `"${r.ean}","${r.custom_name || ""}","${r.rating}","${r.price || ""}","${r.created_at}"\n`;
+      csv += `"${r.ean}","${r.custom_name || ""}","${r.rating}","${r.price || ""}","${r.store || ""}","${r.created_at}"\n`;
     });
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = "moje_oceny_produktow.csv";
+    link.download = "moje_recenzje.csv";
     link.click();
   };
 
@@ -280,12 +344,12 @@ export default function Home() {
         )}
       </header>
 
-      {/* Zakładka 1: Lista zakupów */}
+      {/* ZAKŁADKA 1: LISTA ZAKUPÓW */}
       {activeTab === "list" && (
         <div className="w-full max-w-md bg-slate-800 p-5 rounded-xl border border-slate-700">
           <h2 className="text-lg font-bold mb-3">Twoja lista zakupów</h2>
           {shoppingList.length === 0 ? (
-            <p className="text-xs text-slate-400">Brak artykułów na liście. Dodaj je skanując produkt!</p>
+            <p className="text-xs text-slate-400">Brak artykułów. Dodaj je, skanując produkt i klikając "+ Dodaj do listy".</p>
           ) : (
             <div className="flex flex-col gap-2">
               {shoppingList.map((item) => (
@@ -307,12 +371,12 @@ export default function Home() {
         </div>
       )}
 
-      {/* Zakładka 2: Profil i eksport CSV */}
+      {/* ZAKŁADKA 2: PROFIL I EKSPORT */}
       {activeTab === "profile" && (
         <div className="w-full max-w-md bg-slate-800 p-5 rounded-xl border border-slate-700">
           {!user ? (
             <form onSubmit={handleAuth} className="flex flex-col gap-3">
-              <h2 className="text-sm font-bold">Zaloguj się linkiem na e-mail</h2>
+              <h2 className="text-sm font-bold">Zaloguj się adresem e-mail</h2>
               <input
                 type="email"
                 placeholder="twoj@email.pl"
@@ -321,7 +385,7 @@ export default function Home() {
                 className="bg-slate-700 border border-slate-600 p-2 rounded text-sm text-white outline-none"
               />
               <button type="submit" className="bg-blue-600 font-bold text-white py-2 rounded text-sm">
-                Wyślij link logowania
+                Wyślij link
               </button>
               {authMessage && <p className="text-xs text-amber-300">{authMessage}</p>}
             </form>
@@ -348,7 +412,10 @@ export default function Home() {
                       <span>{"★".repeat(rev.rating)}</span>
                     </div>
                     {rev.comment && <p className="text-slate-300 mt-1">{rev.comment}</p>}
-                    <p className="text-[10px] text-slate-500 mt-1">{new Date(rev.created_at).toLocaleDateString("pl-PL")}</p>
+                    <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                      <span>{rev.store && `Sklep: ${rev.store}`} {rev.price && `(${rev.price} zł)`}</span>
+                      <span>{new Date(rev.created_at).toLocaleDateString("pl-PL")}</span>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -357,7 +424,7 @@ export default function Home() {
         </div>
       )}
 
-      {/* Zakładka 3: Skaner główny */}
+      {/* ZAKŁADKA 3: SKANER I WYNIKI */}
       {activeTab === "scan" && (
         <>
           {!ean && (
@@ -372,22 +439,43 @@ export default function Home() {
                 </button>
               </div>
 
-              {/* Szukajka ręczna (kod lub nazwa) */}
+              {/* Ręczna wyszukiwarka kodem lub nazwą */}
               <div className="bg-slate-800 p-3 rounded-xl border border-slate-700 flex gap-2">
                 <input
                   type="text"
-                  placeholder="Wpisz EAN..."
+                  placeholder="Wpisz kod EAN lub nazwę towaru..."
                   value={manualQuery}
                   onChange={(e) => setManualQuery(e.target.value)}
                   className="bg-slate-700 border border-slate-600 p-2 rounded flex-1 text-sm text-white outline-none"
                 />
                 <button
-                  onClick={() => manualQuery && loadProductData(manualQuery.trim())}
-                  className="bg-blue-600 px-4 rounded text-sm font-bold text-white"
+                  onClick={handleTextSearch}
+                  disabled={searching}
+                  className="bg-blue-600 px-4 rounded text-sm font-bold text-white disabled:opacity-50"
                 >
-                  Szukaj
+                  {searching ? "..." : "Szukaj"}
                 </button>
               </div>
+
+              {/* Lista wyników wyszukiwania tekstowego */}
+              {searchResults.length > 0 && (
+                <div className="bg-slate-800 p-3 rounded-xl border border-slate-700 flex flex-col gap-2">
+                  <h4 className="text-xs font-bold text-slate-300">Wyniki wyszukiwania:</h4>
+                  {searchResults.map((prod) => (
+                    <button
+                      key={prod.code}
+                      onClick={() => loadProductData(prod.code)}
+                      className="flex items-center gap-2 p-2 bg-slate-700/50 hover:bg-slate-700 rounded text-left"
+                    >
+                      {prod.image_small_url && <img src={prod.image_small_url} className="w-8 h-8 object-contain" />}
+                      <div className="flex-1 truncate">
+                        <p className="text-xs font-bold text-white truncate">{prod.product_name || "Bez nazwy"}</p>
+                        <p className="text-[10px] text-slate-400">EAN: {prod.code}</p>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
 
               {recentScans.length > 0 && (
                 <div className="bg-slate-800 p-3 rounded-xl border border-slate-700">
@@ -411,47 +499,59 @@ export default function Home() {
           {product && (
             <div className="w-full max-w-md flex flex-col gap-4">
               <div className="bg-slate-800 p-5 rounded-xl border border-slate-700 flex flex-col items-center">
-                {product.image_url && (
+                {product.image_url ? (
                   <img src={product.image_url} alt="Produkt" className="w-32 h-32 object-contain mb-3 bg-white rounded-lg p-1" />
+                ) : (
+                  <div className="mb-3 text-center">
+                    <label className="cursor-pointer bg-slate-700 border border-slate-600 px-3 py-2 rounded text-xs text-blue-400 font-bold block">
+                      📷 {uploadingImage ? "Wgrywanie..." : "Dodaj zdjęcie produktu"}
+                      <input type="file" accept="image/*" capture="environment" onChange={handleImageUpload} className="hidden" />
+                    </label>
+                  </div>
                 )}
 
                 <h2 className="text-lg font-bold text-center text-white">{product.product_name}</h2>
                 <p className="text-slate-400 text-xs mb-3">EAN: {ean}</p>
 
-                {/* Etykiety Zdrowotne: Nutri-Score, Alergeny, Vegan */}
-                <div className="flex flex-wrap gap-2 justify-center mb-4 text-xs font-bold">
+                {/* Etykiety: Nutri-Score, Eco-Score, Vegan, Alergeny */}
+                <div className="flex flex-wrap gap-1.5 justify-center mb-4 text-[11px] font-bold">
                   {product.nutriScore && (
-                    <span className="bg-emerald-900 text-emerald-300 border border-emerald-500 px-2 py-0.5 rounded">
+                    <span className="bg-emerald-950 text-emerald-300 border border-emerald-500 px-2 py-0.5 rounded">
                       Nutri-Score: {product.nutriScore}
                     </span>
                   )}
+                  {product.ecoScore && (
+                    <span className="bg-teal-950 text-teal-300 border border-teal-500 px-2 py-0.5 rounded">
+                      Eco-Score: {product.ecoScore}
+                    </span>
+                  )}
                   {product.isVegan !== null && (
-                    <span className="bg-lime-900 text-lime-300 border border-lime-500 px-2 py-0.5 rounded">
+                    <span className="bg-lime-950 text-lime-300 border border-lime-500 px-2 py-0.5 rounded">
                       {product.isVegan ? "🌱 Wegański" : "🥩 Niewegański"}
                     </span>
                   )}
                   {product.allergens && (
-                    <span className="bg-amber-900 text-amber-300 border border-amber-500 px-2 py-0.5 rounded">
+                    <span className="bg-amber-950 text-amber-300 border border-amber-500 px-2 py-0.5 rounded">
                       ⚠️ Alergeny: {product.allergens}
                     </span>
                   )}
                 </div>
 
-                {/* Zapis własnej nazwy produktu */}
+                {/* Własna nazwa */}
                 <div className="w-full mb-3">
                   <label className="text-[11px] text-slate-300 block mb-1">
-                    {product.product_name === "Nieznany produkt" ? "Nadaj stałą nazwę temu produktowi:" : "Zmień/popraw nazwę dla wszystkich:"}
+                    {product.product_name === "Nieznany produkt" ? "Nadaj stałą nazwę:" : "Zmień nazwę dla wszystkich:"}
                   </label>
                   <input
                     type="text"
-                    placeholder="Wpisz pełną nazwę..."
+                    placeholder="Wpisz pełną nazwę towaru..."
                     value={customName}
                     onChange={(e) => setCustomName(e.target.value)}
                     className="w-full bg-slate-700 border border-amber-500/50 p-2 rounded text-sm text-white outline-none"
                   />
                 </div>
 
-                {/* Statystyki: Średnia, % Poleceń, Śr. Cena */}
+                {/* Statystyki społeczności */}
                 <div className="grid grid-cols-3 gap-2 w-full mb-4 text-center">
                   <div className="bg-slate-700/60 border border-slate-600 rounded p-2">
                     <span className="text-lg font-bold text-blue-400">{averageRating || "-"}</span>
@@ -467,7 +567,7 @@ export default function Home() {
                   </div>
                 </div>
 
-                {/* Formularz Recenzji */}
+                {/* Formularz dodawania recenzji */}
                 <div className="flex gap-2 mb-3">
                   {[1, 2, 3, 4, 5].map((num) => (
                     <button
@@ -499,8 +599,9 @@ export default function Home() {
                     <option value="Lidl">Lidl</option>
                     <option value="Dino">Dino</option>
                     <option value="Kaufland">Kaufland</option>
+                    <option value="Carrefour">Carrefour</option>
                     <option value="Żabka">Żabka</option>
-                    <option value="Inny">Inny sklep</option>
+                    <option value="Inny">Inny</option>
                   </select>
                   <button
                     type="button"
@@ -569,7 +670,7 @@ export default function Home() {
                         <span className="text-slate-500 text-[10px]">{new Date(rev.created_at).toLocaleDateString("pl-PL")}</span>
                       </div>
                       <div className="flex gap-2 text-[11px] text-slate-400 mb-1">
-                        <span>{rev.is_recommended ? "👍 Poleca" : "👎 Odradza"}</span>
+                        <span>{rev.is_recommended ? "👍 Poleca" : "👎 Odradzam"}</span>
                         {rev.price && <span>• {rev.price} zł ({rev.store || "Sklep"})</span>}
                       </div>
                       {rev.comment && <p className="text-slate-200">{rev.comment}</p>}
