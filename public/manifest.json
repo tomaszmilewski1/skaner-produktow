@@ -1,0 +1,15 @@
+{
+  "name": "Skaner Produktów",
+  "short_name": "Skaner",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#2563eb",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/3126/3126504.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
