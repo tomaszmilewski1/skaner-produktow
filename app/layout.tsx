@@ -5,7 +5,11 @@ export const metadata = {
   description: "Aplikacja do skanowania i oceniania",
 };
 
-export default function RootLayout({ children }) {
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
   return (
     <html lang="pl">
       <body>{children}</body>
