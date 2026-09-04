@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import Scanner from "../components/Scanner";
 import { supabase } from "../lib/supabase";
 
@@ -25,6 +25,9 @@ export default function Home() {
   const [userReviews, setUserReviews] = useState([]);
   const [uploadingImg, setUploadingImg] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
+
+  // Referencja do aktywnego strumienia wideo kamery
+  const streamRef = useRef(null);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -62,7 +65,44 @@ export default function Home() {
     } catch {}
   };
 
+  // Gaszenie flesza i zwalnianie kamery
+  const turnOffTorch = async () => {
+    if (streamRef.current) {
+      const track = streamRef.current.getVideoTracks()[0];
+      if (track) {
+        try {
+          await track.applyConstraints({ advanced: [{ torch: false }] });
+        } catch {}
+        track.stop();
+      }
+      streamRef.current = null;
+    }
+    setTorchOn(false);
+  };
+
+  const toggleTorch = async () => {
+    try {
+      if (!torchOn) {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+        streamRef.current = stream;
+        const track = stream.getVideoTracks()[0];
+        const cap = track.getCapabilities ? track.getCapabilities() : {};
+        if (cap.torch) {
+          await track.applyConstraints({ advanced: [{ torch: true }] });
+          setTorchOn(true);
+        } else {
+          alert("Flesz niedostępny w Twoim aparacie.");
+        }
+      } else {
+        await turnOffTorch();
+      }
+    } catch {
+      alert("Błąd dostępu do flesza.");
+    }
+  };
+
   const resetToScan = () => {
+    turnOffTorch();
     setEan(null);
     setProduct(null);
     setSearchResults([]);
@@ -70,46 +110,65 @@ export default function Home() {
     setActiveTab("scan");
   };
 
-  const toggleTorch = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-      const track = stream.getVideoTracks()[0];
-      if (track.getCapabilities().torch) {
-        await track.applyConstraints({ advanced: [{ torch: !torchOn }] });
-        setTorchOn(!torchOn);
-      }
-    } catch { alert("Flesz niedostępny w tej przeglądarce."); }
-  };
-
   const fetchReviews = async (code) => {
     const { data } = await supabase.from("reviews").select("*").eq("ean", code).order("created_at", { ascending: false });
     if (data) setReviews(data);
   };
 
+  // Łączenie wielu darmowych baz danych (Supabase -> Food -> Products -> Beauty)
   const loadProductData = async (code) => {
+    await turnOffTorch();
     playBeep();
     if (navigator.vibrate) navigator.vibrate(80);
     setEan(code);
     setSearchResults([]);
 
+    // 1. Sprawdzamy własną bazę użytkowników w Supabase
     const { data: nameData } = await supabase.from("product_names").select("custom_name, custom_image").eq("ean", code).single();
     let pName = nameData?.custom_name || null;
     let img = nameData?.custom_image || "";
     let nutri = null, eco = null, palm = null, vegan = null, nutriments = null;
 
-    try {
-      const res = await fetch(`https://world.openfoodfacts.org/api/v2/product/${code}.json`);
-      const d = await res.json();
-      if (d.status === 1) {
-        if (!pName) pName = d.product.product_name;
-        if (!img) img = d.product.image_url || "";
-        nutri = d.product.nutriscore_grade?.toUpperCase();
-        eco = d.product.ecoscore_grade?.toUpperCase();
-        palm = d.product.ingredients_from_palm_oil_n > 0;
-        vegan = d.product.ingredients_analysis_tags?.includes("en:vegan");
-        nutriments = d.product.nutriments;
-      }
-    } catch {}
+    // 2. Jeśli brak nazwy, pytamy Open Food Facts (żywność)
+    if (!pName) {
+      try {
+        const res = await fetch(`https://world.openfoodfacts.org/api/v2/product/${code}.json`);
+        const d = await res.json();
+        if (d.status === 1) {
+          pName = d.product.product_name;
+          img = d.product.image_url || "";
+          nutri = d.product.nutriscore_grade?.toUpperCase();
+          eco = d.product.ecoscore_grade?.toUpperCase();
+          palm = d.product.ingredients_from_palm_oil_n > 0;
+          vegan = d.product.ingredients_analysis_tags?.includes("en:vegan");
+          nutriments = d.product.nutriments;
+        }
+      } catch {}
+    }
+
+    // 3. Jeśli nadal brak, pytamy Open Products Facts (chemia, AGD, mleczka, proszki)
+    if (!pName) {
+      try {
+        const res = await fetch(`https://world.openproductsfacts.org/api/v0/product/${code}.json`);
+        const d = await res.json();
+        if (d.status === 1) {
+          pName = d.product.product_name;
+          if (!img) img = d.product.image_url || "";
+        }
+      } catch {}
+    }
+
+    // 4. Jeśli nadal brak, pytamy Open Beauty Facts (kosmetyki, kremy)
+    if (!pName) {
+      try {
+        const res = await fetch(`https://world.openbeautyfacts.org/api/v0/product/${code}.json`);
+        const d = await res.json();
+        if (d.status === 1) {
+          pName = d.product.product_name;
+          if (!img) img = d.product.image_url || "";
+        }
+      } catch {}
+    }
 
     const finalName = pName || "Nieznany produkt";
     setProduct({
@@ -205,7 +264,6 @@ export default function Home() {
 
   return (
     <main className="min-h-screen p-3 flex flex-col items-center bg-slate-950 text-slate-100 font-sans">
-      {/* GÓRNY PASEK Z NAWIGACJĄ */}
       <header className="w-full max-w-md flex justify-between items-center mb-3 pb-2 border-b border-slate-800 text-xs">
         <div className="flex gap-1.5 items-center">
           {ean ? (
@@ -227,7 +285,6 @@ export default function Home() {
         {user && <button onClick={() => supabase.auth.signOut().then(() => setUser(null))} className="text-rose-400">Wyloguj</button>}
       </header>
 
-      {/* LISTA ZAKUPÓW */}
       {activeTab === "list" && (
         <div className="w-full max-w-md bg-slate-900 p-4 rounded-xl border border-slate-800 text-xs">
           <h2 className="font-bold text-sm mb-3">Lista zakupowa</h2>
@@ -240,7 +297,6 @@ export default function Home() {
         </div>
       )}
 
-      {/* PROFIL UŻYTKOWNIKA */}
       {activeTab === "profile" && (
         <div className="w-full max-w-md bg-slate-900 p-4 rounded-xl border border-slate-800 text-xs">
           {!user ? (
@@ -264,7 +320,6 @@ export default function Home() {
                 <button onClick={exportCSV} className="bg-emerald-600 px-2.5 py-1 rounded text-white font-bold text-[11px]">Pobierz CSV</button>
               </div>
 
-              {/* STATYSTYKI KONTA */}
               <div className="grid grid-cols-3 gap-2 bg-slate-800/60 p-2.5 rounded-lg border border-slate-700 text-center mb-4">
                 <div><span className="text-slate-400 block text-[10px]">Ocenione</span><b className="text-blue-400 text-sm">{userReviews.length}</b></div>
                 <div><span className="text-slate-400 block text-[10px]">Śr. gwiazdek</span><b className="text-amber-400 text-sm">{(userReviews.reduce((a,b)=>a+b.rating,0)/(userReviews.length||1)).toFixed(1)}★</b></div>
@@ -289,7 +344,6 @@ export default function Home() {
         </div>
       )}
 
-      {/* SKANER I KAFELKOWA HISTORIA */}
       {activeTab === "scan" && (
         <>
           {!ean && (
@@ -301,13 +355,11 @@ export default function Home() {
                 </button>
               </div>
 
-              {/* SZUKAJ PO EAN LUB NAZWIE */}
               <div className="bg-slate-900 p-2.5 rounded-xl border border-slate-800 flex gap-2">
                 <input type="text" placeholder="Wpisz kod EAN lub nazwę..." value={manualQuery} onChange={(e) => setManualQuery(e.target.value)} className="bg-slate-800 border border-slate-700 p-1.5 rounded text-xs flex-1 text-white outline-none" />
                 <button onClick={handleSearch} className="bg-blue-600 px-3 py-1.5 rounded text-xs font-bold text-white">Szukaj</button>
               </div>
 
-              {/* WYNIKI WYSZUKIWANIA TEKSTOWEGO */}
               {searchResults.length > 0 && (
                 <div className="bg-slate-900 p-2 rounded-xl border border-slate-800 flex flex-col gap-1.5">
                   <span className="text-[10px] font-bold text-slate-400 uppercase">Wyniki wyszukiwania:</span>
@@ -320,7 +372,6 @@ export default function Home() {
                 </div>
               )}
 
-              {/* KAFELKOWA HISTORIA OSTATNICH SKANÓW */}
               {recentScans.length > 0 && (
                 <div className="bg-slate-900 p-3 rounded-xl border border-slate-800 text-xs">
                   <span className="text-[10px] text-slate-500 uppercase font-bold block mb-2">Ostatnio sprawdzane:</span>
@@ -340,7 +391,6 @@ export default function Home() {
             </div>
           )}
 
-          {/* KARTA ZESKANOWANEGO PRODUKTU */}
           {product && (
             <div className="w-full max-w-md flex flex-col gap-3">
               <div className="bg-slate-900 p-4 rounded-xl border border-slate-800 flex flex-col items-center text-xs">
@@ -360,7 +410,6 @@ export default function Home() {
                   <button onClick={() => { navigator.clipboard.writeText(ean); alert("Skopiowano EAN!"); }} className="text-blue-400 text-[10px]">📋 Kopiuj</button>
                 </div>
 
-                {/* ETYKIETY */}
                 <div className="flex flex-wrap gap-1 justify-center mb-3">
                   {product.nutri && <span className="bg-emerald-950 text-emerald-300 border border-emerald-600 px-1.5 py-0.5 rounded font-bold">Nutri: {product.nutri}</span>}
                   {product.eco && <span className="bg-teal-950 text-teal-300 border border-teal-600 px-1.5 py-0.5 rounded font-bold">Eco: {product.eco}</span>}
@@ -368,7 +417,6 @@ export default function Home() {
                   {product.palm && <span className="bg-amber-950 text-amber-300 border border-amber-600 px-1.5 py-0.5 rounded font-bold">⚠️ Olej palmowy</span>}
                 </div>
 
-                {/* MAKRO */}
                 {product.kcal && (
                   <div className="grid grid-cols-4 gap-1 w-full bg-slate-800/80 p-2 rounded-lg text-center mb-3 border border-slate-700">
                     <div><span className="text-[10px] text-slate-400 block">Kcal</span><b className="text-white">{product.kcal}</b></div>
@@ -393,8 +441,8 @@ export default function Home() {
                 </div>
 
                 <div className="grid grid-cols-3 gap-1.5 w-full mb-2">
-                  <input type="number" step="0.01" placeholder="Cena zł" value={price} onChange={(e) => setPrice(e.target.value)} className="bg-slate-800 border border-slate-700 p-1.5 rounded text-xs text-white" />
-                  <select value={store} onChange={(e) => setStore(e.target.value)} className="bg-slate-800 border border-slate-700 p-1.5 rounded text-xs text-white">
+                  <input type="number" step="0.01" placeholder="Cena zł" value={price} onChange={(e) => setPrice(e.target.value)} className="bg-slate-800 border border-slate-700 p-1.5 rounded text-xs text-white outline-none" />
+                  <select value={store} onChange={(e) => setStore(e.target.value)} className="bg-slate-800 border border-slate-700 p-1.5 rounded text-xs text-white outline-none">
                     <option value="Biedronka">Biedronka</option><option value="Lidl">Lidl</option><option value="Dino">Dino</option><option value="Żabka">Żabka</option><option value="Kaufland">Kaufland</option>
                   </select>
                   <button type="button" onClick={() => setIsRec(!isRec)} className={`rounded font-bold text-[10px] border ${isRec ? "bg-emerald-950 border-emerald-600 text-emerald-300" : "bg-rose-950 border-rose-600 text-rose-300"}`}>
@@ -402,7 +450,7 @@ export default function Home() {
                   </button>
                 </div>
 
-                <textarea placeholder="Komentarz..." value={comment} onChange={(e) => setComment(e.target.value)} rows={2} className="w-full bg-slate-800 border border-slate-700 p-1.5 rounded text-xs text-white mb-2" />
+                <textarea placeholder="Komentarz..." value={comment} onChange={(e) => setComment(e.target.value)} rows={2} className="w-full bg-slate-800 border border-slate-700 p-1.5 rounded text-xs text-white mb-2 outline-none" />
                 <button onClick={saveReview} disabled={isSubmitting} className="w-full bg-blue-600 text-white font-bold py-2 rounded-lg text-xs">
                   {isSubmitting ? "Zapis..." : "Zapisz recenzję"}
                 </button>
@@ -413,7 +461,6 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* OPINIE */}
               <div className="bg-slate-900 p-3 rounded-xl border border-slate-800 text-xs">
                 <span className="font-bold text-white block mb-2">Opinie ({reviews.length}) • Średnia: {avgRating || "-"}★</span>
                 {reviews.map((r) => (
